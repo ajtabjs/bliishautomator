@@ -68,6 +68,9 @@ Run `solver.py` with no args to do everything automatically:
 2. Solve Turnstile on Bliish
 3. Send signup magic-link request
 4. Poll inbox, open verification link, wait 1 second, and click the button on the callback page
+5. Extract and print `sb-prkqirdzadljdpkrvjvz-auth-token`
+
+The flow prints debug logs for each step as it runs.
 
 ```bash
 python solver.py

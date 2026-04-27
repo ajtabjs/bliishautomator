@@ -20,6 +20,11 @@ DEFAULT_SITEURL = "https://bliish.com/"
 BLIISH_MAGIC_LINK_URL = "https://bliish.com/api/v1/auth/magic-link"
 MAILTM_BASE_URL = "https://api.mail.tm"
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+AUTH_COOKIE_NAME = "sb-prkqirdzadljdpkrvjvz-auth-token"
+
+
+def _debug(message: str) -> None:
+    print(f"[debug] {message}")
 
 
 def _find_chrome() -> str:
@@ -156,12 +161,14 @@ def create_temp_mail_account(
     password: Optional[str] = None,
     timeout: int = 30,
 ) -> dict:
+    _debug("Step 1/6: creating temporary Mail.tm account")
     if address and "@" not in address:
         raise ValueError("address must include '@' when provided")
 
     if not address:
         domain = _first_active_mailtm_domain(timeout=timeout)
         address = f"{_random_mail_local_part()}@{domain}"
+        _debug(f"Selected Mail.tm domain: {domain}")
     if not password:
         password = _random_mail_password()
 
@@ -212,10 +219,12 @@ def wait_for_verification_link(
     timeout: int = 180,
     poll_interval: int = 5,
 ) -> str:
+    _debug("Step 4/6: waiting for verification email")
     deadline = time.time() + timeout
     seen = set()
 
     while time.time() < deadline:
+        _debug("Polling Mail.tm inbox for new messages")
         box = _mailtm_request("GET", "/messages?page=1", token=mail_token, timeout=30)
         messages = _mailtm_items(box)
 
@@ -231,7 +240,9 @@ def wait_for_verification_link(
             if host_hint:
                 for url in urls:
                     if host_hint.lower() in url.lower():
+                        _debug(f"Verification link found: {url}")
                         return url
+            _debug(f"Verification link found: {urls[0]}")
             return urls[0]
 
         time.sleep(poll_interval)
@@ -248,8 +259,10 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         user_data_dir=_get_profile_dir(),
     )
     try:
+        _debug("Step 5/6: opening verification callback page")
         page = await browser.get(url)
         await asyncio.sleep(1.0)
+        _debug("Waiting 1 second before clicking callback button")
         clicked = await page.evaluate("""
             (() => {
                 const isVisible = (el) => {
@@ -282,8 +295,36 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         """)
         if not clicked or not clicked.get("clicked"):
             raise RuntimeError("No clickable button found on callback page")
+        _debug(f"Clicked callback button: {clicked.get('label', '')}")
         await asyncio.sleep(1.0)
-        return {"status": 200, "button": clicked.get("label", "")}
+        _debug("Waiting 1 second after button click")
+
+        cookie_value = None
+        deadline = time.time() + min(timeout, 15)
+        while time.time() < deadline:
+            cookie_value = await page.evaluate(f"""
+                (() => {{
+                    const all = document.cookie || '';
+                    const parts = all.split(';').map(p => p.trim());
+                    const target = parts.find(p => p.startsWith('{AUTH_COOKIE_NAME}='));
+                    if (!target) return null;
+                    return target.substring('{AUTH_COOKIE_NAME}='.length);
+                }})()
+            """)
+            if cookie_value:
+                break
+            await asyncio.sleep(0.5)
+
+        if not cookie_value:
+            raise RuntimeError(f"Cookie '{AUTH_COOKIE_NAME}' not found after verification")
+
+        _debug(f"Step 6/6: extracted auth cookie '{AUTH_COOKIE_NAME}'")
+        print(f"{AUTH_COOKIE_NAME}={cookie_value}")
+        return {
+            "status": 200,
+            "button": clicked.get("label", ""),
+            "auth_cookie": cookie_value,
+        }
     finally:
         browser.stop()
 
@@ -319,6 +360,7 @@ def create_mailtm_account_and_verify(
         "verification_url": verification_url,
         "verification_status": verification["status"],
         "verification_button": verification["button"],
+        "auth_cookie": verification["auth_cookie"],
     }
 
 
@@ -328,6 +370,7 @@ def send_magic_link_request(
     intent: str = "signup",
     timeout: int = 45,
 ) -> dict:
+    _debug("Step 3/6: sending Bliish magic-link API request")
     payload = {
         "email": email,
         "turnstileToken": turnstile_token,
@@ -370,6 +413,7 @@ def create_temp_mail_and_request_magic_link(
     timeout: int = 45,
 ) -> dict:
     mail = create_temp_mail_account(timeout=timeout)
+    _debug("Step 2/6: solving Turnstile token")
     turnstile_token = solve(sitekey=sitekey, siteurl=siteurl, timeout=timeout)
     request_result = send_magic_link_request(
         email=mail["address"],
@@ -394,6 +438,7 @@ def create_temp_mail_and_register_bliish(
     verify_timeout: int = 180,
     poll_interval: int = 5,
 ) -> dict:
+    _debug("Starting full Bliish signup flow")
     result = create_temp_mail_and_request_magic_link(
         sitekey=sitekey,
         siteurl=siteurl,
@@ -412,6 +457,7 @@ def create_temp_mail_and_register_bliish(
         "verification_url": verification_url,
         "verification_status": verification["status"],
         "verification_button": verification["button"],
+        "auth_cookie": verification["auth_cookie"],
     }
 
 
@@ -425,6 +471,7 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
     )
 
     try:
+        _debug(f"Opening target page: {siteurl}")
         page = await browser.get(siteurl)
         await asyncio.sleep(random.uniform(2.0, 3.0))
 
@@ -497,6 +544,7 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
         # Check if already auto-solved (invisible widget)
         token = await get_token()
         if token:
+            _debug("Turnstile solved automatically")
             return token
 
         # Wait up to 10s for the visible checkbox iframe to appear
@@ -538,6 +586,7 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
     if not token:
         raise TimeoutError(f"Turnstile token not obtained within {timeout}s")
 
+    _debug("Turnstile token solved successfully")
     return token
 
 
