@@ -61,25 +61,56 @@ sudo apt install xvfb
 
 ## Usage
 
-### Option A — Standalone solver (single token)
+### Option A — Default mode (full Bliish signup flow)
 
-Run `solver.py` directly from the command line:
+Run `solver.py` with no args to do everything automatically:
+1. Create a Mail.tm inbox
+2. Solve Turnstile on Bliish
+3. Send signup magic-link request
+4. Poll inbox, open verification link, wait 1 second, and click the button on the callback page
+
+```bash
+python solver.py
+```
+
+### Option A.1 — Standalone token solver
 
 ```bash
 python solver.py <sitekey> <siteurl>
 ```
 
-**Example:**
+---
+
+### Option A.2 — Mail.tm temp inbox helpers (inside `solver.py`)
+
+Create a temporary Mail.tm account:
 
 ```bash
-python solver.py 0x4AAAAAAActoBfh_En8yr3T https://example.com/
+python solver.py --mailtm-create
 ```
 
-**Output:**
+Send Bliish magic-link request directly:
 
+```bash
+python solver.py --magic-link <email> <turnstile_token> [intent]
 ```
-[solver] clicking Cloudflare iframe at (48, 52)
-0.abc123...longtoken...xyz
+
+Create temp inbox, solve Turnstile, send magic-link request, and verify:
+
+```bash
+python solver.py --mailtm-magic-link [intent] [timeout]
+```
+
+Wait for an incoming verification link (prints URL):
+
+```bash
+python solver.py --mailtm-wait <mailtm_token> [host_hint] [timeout]
+```
+
+Create inbox and auto-open first matching verification link:
+
+```bash
+python solver.py --mailtm-create-and-verify [host_hint] [timeout]
 ```
 
 ---

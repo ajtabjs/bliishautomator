@@ -3,14 +3,23 @@ import json
 import os
 import platform
 import random
+import re
+import string
 import subprocess
 import time
+import urllib.error
+import urllib.request
+from html import unescape
 from typing import Optional
 """
 MADE BY ISMOILOFF. GOOD LUCK HAVE FUN, THIS IS JUST PROJECT, USE IT ON UR OWN RISKS!
 
 """
-import nodriver as uc
+DEFAULT_SITEKEY = "0x4AAAAAACjDDNAekcUcF0h5"
+DEFAULT_SITEURL = "https://bliish.com/"
+BLIISH_MAGIC_LINK_URL = "https://bliish.com/api/v1/auth/magic-link"
+MAILTM_BASE_URL = "https://api.mail.tm"
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
 
 def _find_chrome() -> str:
@@ -68,7 +77,347 @@ def _start_xvfb_if_needed() -> Optional[subprocess.Popen]:
     return proc
 
 
+def _mailtm_request(
+    method: str,
+    path: str,
+    payload: Optional[dict] = None,
+    token: Optional[str] = None,
+    timeout: int = 30,
+) -> dict:
+    body = None if payload is None else json.dumps(payload).encode()
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = urllib.request.Request(
+        f"{MAILTM_BASE_URL}{path}",
+        data=body,
+        headers=headers,
+        method=method,
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            error_obj = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            error_obj = {}
+        detail = (
+            error_obj.get("hydra:description")
+            or error_obj.get("detail")
+            or raw
+            or str(exc)
+        )
+        raise RuntimeError(
+            f"Mail.tm {method} {path} failed ({exc.code}): {detail}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Mail.tm request failed: {exc.reason}") from exc
+
+
+def _mailtm_items(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        if isinstance(payload.get("hydra:member"), list):
+            return [x for x in payload["hydra:member"] if isinstance(x, dict)]
+        if isinstance(payload.get("member"), list):
+            return [x for x in payload["member"] if isinstance(x, dict)]
+    return []
+
+
+def _first_active_mailtm_domain(timeout: int = 30) -> str:
+    domains = _mailtm_items(_mailtm_request("GET", "/domains?page=1", timeout=timeout))
+    for item in domains:
+        if item.get("isActive") and not item.get("isPrivate"):
+            return item["domain"]
+    raise RuntimeError("No active public mail.tm domains are available")
+
+
+def _random_mail_local_part() -> str:
+    suffix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(10))
+    return f"bliish{suffix}"
+
+
+def _random_mail_password() -> str:
+    chars = string.ascii_letters + string.digits
+    suffix = "".join(random.choice(chars) for _ in range(10))
+    return f"Bliish!{suffix}9"
+
+
+def create_temp_mail_account(
+    address: Optional[str] = None,
+    password: Optional[str] = None,
+    timeout: int = 30,
+) -> dict:
+    if address and "@" not in address:
+        raise ValueError("address must include '@' when provided")
+
+    if not address:
+        domain = _first_active_mailtm_domain(timeout=timeout)
+        address = f"{_random_mail_local_part()}@{domain}"
+    if not password:
+        password = _random_mail_password()
+
+    account = _mailtm_request(
+        "POST",
+        "/accounts",
+        payload={"address": address, "password": password},
+        timeout=timeout,
+    )
+    token = _mailtm_request(
+        "POST",
+        "/token",
+        payload={"address": address, "password": password},
+        timeout=timeout,
+    )
+    return {
+        "address": address,
+        "password": password,
+        "token": token["token"],
+        "account_id": account["id"],
+    }
+
+
+def _extract_message_urls(message: dict) -> list[str]:
+    content_parts = []
+    for key in ("subject", "intro", "text"):
+        value = message.get(key)
+        if isinstance(value, str):
+            content_parts.append(value)
+    html_part = message.get("html")
+    if isinstance(html_part, str):
+        content_parts.append(html_part)
+    elif isinstance(html_part, list):
+        content_parts.extend(v for v in html_part if isinstance(v, str))
+
+    merged = unescape("\n".join(content_parts))
+    urls = []
+    for url in _URL_RE.findall(merged):
+        cleaned = url.rstrip(").,;\"'")
+        if cleaned not in urls:
+            urls.append(cleaned)
+    return urls
+
+
+def wait_for_verification_link(
+    mail_token: str,
+    host_hint: str = "bliish.com",
+    timeout: int = 180,
+    poll_interval: int = 5,
+) -> str:
+    deadline = time.time() + timeout
+    seen = set()
+
+    while time.time() < deadline:
+        box = _mailtm_request("GET", "/messages?page=1", token=mail_token, timeout=30)
+        messages = _mailtm_items(box)
+
+        for msg in messages:
+            msg_id = msg.get("id")
+            if not msg_id or msg_id in seen:
+                continue
+            seen.add(msg_id)
+            full = _mailtm_request("GET", f"/messages/{msg_id}", token=mail_token, timeout=30)
+            urls = _extract_message_urls(full)
+            if not urls:
+                continue
+            if host_hint:
+                for url in urls:
+                    if host_hint.lower() in url.lower():
+                        return url
+            return urls[0]
+
+        time.sleep(poll_interval)
+
+    raise TimeoutError(f"No verification link received within {timeout}s")
+
+
+async def _open_verification_and_click_button(url: str, timeout: int = 45) -> dict:
+    import nodriver as uc
+
+    browser = await uc.start(
+        browser_executable_path=_find_chrome(),
+        headless=False,
+        user_data_dir=_get_profile_dir(),
+    )
+    try:
+        page = await browser.get(url)
+        await asyncio.sleep(1.0)
+        clicked = await page.evaluate("""
+            (() => {
+                const isVisible = (el) => {
+                    const st = window.getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+
+                const getLabel = (el) => {
+                    if (el instanceof HTMLInputElement) return (el.value || '').trim();
+                    return (el.innerText || el.textContent || '').trim();
+                };
+
+                const candidates = Array.from(
+                    document.querySelectorAll('button, input[type="submit"], [role="button"], a')
+                );
+                for (const el of candidates) {
+                    if (!isVisible(el)) continue;
+                    if (el instanceof HTMLButtonElement && el.disabled) continue;
+                    if (el instanceof HTMLInputElement && el.disabled) continue;
+                    const label = getLabel(el);
+                    if (!label && !(el instanceof HTMLInputElement)) continue;
+                    el.scrollIntoView({behavior: 'instant', block: 'center', inline: 'center'});
+                    el.click();
+                    return {clicked: true, label: label || 'submit'};
+                }
+                return {clicked: false, label: ''};
+            })()
+        """)
+        if not clicked or not clicked.get("clicked"):
+            raise RuntimeError("No clickable button found on callback page")
+        await asyncio.sleep(1.0)
+        return {"status": 200, "button": clicked.get("label", "")}
+    finally:
+        browser.stop()
+
+
+def verify_link(url: str, timeout: int = 45) -> dict:
+    import warnings
+
+    xvfb = _start_xvfb_if_needed()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return asyncio.run(_open_verification_and_click_button(url, timeout=timeout))
+    finally:
+        if xvfb:
+            xvfb.terminate()
+
+
+def create_mailtm_account_and_verify(
+    host_hint: str = "bliish.com",
+    timeout: int = 180,
+    poll_interval: int = 5,
+) -> dict:
+    mail = create_temp_mail_account()
+    verification_url = wait_for_verification_link(
+        mail_token=mail["token"],
+        host_hint=host_hint,
+        timeout=timeout,
+        poll_interval=poll_interval,
+    )
+    verification = verify_link(verification_url)
+    return {
+        **mail,
+        "verification_url": verification_url,
+        "verification_status": verification["status"],
+        "verification_button": verification["button"],
+    }
+
+
+def send_magic_link_request(
+    email: str,
+    turnstile_token: str,
+    intent: str = "signup",
+    timeout: int = 45,
+) -> dict:
+    payload = {
+        "email": email,
+        "turnstileToken": turnstile_token,
+        "intent": intent,
+    }
+    req = urllib.request.Request(
+        BLIISH_MAGIC_LINK_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            body = json.loads(raw) if raw else {}
+            return {
+                "status": getattr(resp, "status", 200),
+                "body": body,
+            }
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            body = {"raw": raw}
+        raise RuntimeError(
+            f"Bliish magic-link request failed ({exc.code}): {body}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Bliish magic-link request failed: {exc.reason}") from exc
+
+
+def create_temp_mail_and_request_magic_link(
+    sitekey: str = DEFAULT_SITEKEY,
+    siteurl: str = DEFAULT_SITEURL,
+    intent: str = "signup",
+    timeout: int = 45,
+) -> dict:
+    mail = create_temp_mail_account(timeout=timeout)
+    turnstile_token = solve(sitekey=sitekey, siteurl=siteurl, timeout=timeout)
+    request_result = send_magic_link_request(
+        email=mail["address"],
+        turnstile_token=turnstile_token,
+        intent=intent,
+        timeout=timeout,
+    )
+    return {
+        "email": mail["address"],
+        "mailtm_token": mail["token"],
+        "mailtm_account_id": mail["account_id"],
+        "turnstile_token": turnstile_token,
+        "magic_link_response": request_result,
+    }
+
+
+def create_temp_mail_and_register_bliish(
+    sitekey: str = DEFAULT_SITEKEY,
+    siteurl: str = DEFAULT_SITEURL,
+    intent: str = "signup",
+    timeout: int = 45,
+    verify_timeout: int = 180,
+    poll_interval: int = 5,
+) -> dict:
+    result = create_temp_mail_and_request_magic_link(
+        sitekey=sitekey,
+        siteurl=siteurl,
+        intent=intent,
+        timeout=timeout,
+    )
+    verification_url = wait_for_verification_link(
+        mail_token=result["mailtm_token"],
+        host_hint="bliish.com",
+        timeout=verify_timeout,
+        poll_interval=poll_interval,
+    )
+    verification = verify_link(verification_url, timeout=timeout)
+    return {
+        **result,
+        "verification_url": verification_url,
+        "verification_status": verification["status"],
+        "verification_button": verification["button"],
+    }
+
+
 async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
+    import nodriver as uc
+
     browser = await uc.start(
         browser_executable_path=_find_chrome(),
         headless=False,
@@ -192,7 +541,7 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
     return token
 
 
-def solve(sitekey: str, siteurl: str, timeout: int = 45) -> str:
+def solve(sitekey: str = DEFAULT_SITEKEY, siteurl: str = DEFAULT_SITEURL, timeout: int = 45) -> str:
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -202,13 +551,86 @@ def solve(sitekey: str, siteurl: str, timeout: int = 45) -> str:
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) < 3:
-        print("Usage: python solver.py <sitekey> <siteurl>")
+    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-create":
+        print(json.dumps(create_temp_mail_account(), indent=2))
+        sys.exit(0)
+
+    if len(sys.argv) >= 4 and sys.argv[1] == "--magic-link":
+        email = sys.argv[2]
+        turnstile_token = sys.argv[3]
+        intent = sys.argv[4] if len(sys.argv) >= 5 else "signup"
+        result = send_magic_link_request(
+            email=email,
+            turnstile_token=turnstile_token,
+            intent=intent,
+        )
+        print(json.dumps(result, indent=2))
+        sys.exit(0)
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-magic-link":
+        intent = sys.argv[2] if len(sys.argv) >= 3 else "signup"
+        timeout = int(sys.argv[3]) if len(sys.argv) >= 4 else 45
+        xvfb = _start_xvfb_if_needed()
+        try:
+            result = create_temp_mail_and_register_bliish(
+                sitekey=DEFAULT_SITEKEY,
+                siteurl=DEFAULT_SITEURL,
+                intent=intent,
+                timeout=timeout,
+            )
+            print(json.dumps(result, indent=2))
+        finally:
+            if xvfb:
+                xvfb.terminate()
+        sys.exit(0)
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--mailtm-wait":
+        token = sys.argv[2]
+        host_hint = sys.argv[3] if len(sys.argv) >= 4 else "bliish.com"
+        timeout = int(sys.argv[4]) if len(sys.argv) >= 5 else 180
+        link = wait_for_verification_link(token, host_hint=host_hint, timeout=timeout)
+        print(link)
+        sys.exit(0)
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-create-and-verify":
+        host_hint = sys.argv[2] if len(sys.argv) >= 3 else "bliish.com"
+        timeout = int(sys.argv[3]) if len(sys.argv) >= 4 else 180
+        result = create_mailtm_account_and_verify(host_hint=host_hint, timeout=timeout)
+        print(json.dumps(result, indent=2))
+        sys.exit(0)
+
+    if len(sys.argv) > 3:
+        print(
+            "Usage: python solver.py\n"
+            "       python solver.py [sitekey] [siteurl]  # token-only mode\n"
+            "       python solver.py --mailtm-create\n"
+            "       python solver.py --magic-link <email> <turnstile_token> [intent]\n"
+            "       python solver.py --mailtm-magic-link [intent] [timeout]  # full signup flow\n"
+            "       python solver.py --mailtm-wait <mailtm_token> [host_hint] [timeout]\n"
+            "       python solver.py --mailtm-create-and-verify [host_hint] [timeout]"
+        )
         sys.exit(1)
+
+    if len(sys.argv) == 1:
+        xvfb = _start_xvfb_if_needed()
+        try:
+            result = create_temp_mail_and_register_bliish(
+                sitekey=DEFAULT_SITEKEY,
+                siteurl=DEFAULT_SITEURL,
+                intent="signup",
+                timeout=45,
+            )
+            print(json.dumps(result, indent=2))
+        finally:
+            if xvfb:
+                xvfb.terminate()
+        sys.exit(0)
 
     xvfb = _start_xvfb_if_needed()
     try:
-        token = solve(sys.argv[1], sys.argv[2])
+        sitekey = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_SITEKEY
+        siteurl = sys.argv[2] if len(sys.argv) >= 3 else DEFAULT_SITEURL
+        token = solve(sitekey, siteurl)
         print(token)
     finally:
         if xvfb:
