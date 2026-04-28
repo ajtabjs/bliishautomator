@@ -21,7 +21,6 @@ DEFAULT_SITEURL = "https://bliish.com/"
 BLIISH_MAGIC_LINK_URL = "https://bliish.com/api/v1/auth/magic-link"
 MAILTM_BASE_URL = "https://api.mail.tm"
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
-AUTH_COOKIE_NAME = "sb-prkqirdzadljdpkrvjvz-auth-token"
 
 
 def _debug(message: str) -> None:
@@ -276,28 +275,29 @@ def wait_for_verification_link(
                 continue
 
             if host_hint:
+                candidates_found = []
                 for url in urls:
-                    # Unwrap any tracker/redirect wrapper first, then check host
                     unwrapped = _unwrap_redirect_url(url)
-                    if host_hint.lower() in unwrapped.lower():
-                        try:
-                            validated = _validate_url(unwrapped)
-                        except ValueError as exc:
-                            _debug(f"Skipping invalid URL {unwrapped!r}: {exc}")
+                    if host_hint.lower() not in unwrapped.lower():
+                        if host_hint.lower() not in url.lower():
                             continue
-                        _debug(f"Verification link found: {validated}")
-                        return validated
-                # If none matched host_hint after unwrapping, try raw urls too
-                for url in urls:
-                    if host_hint.lower() in url.lower():
-                        unwrapped = _unwrap_redirect_url(url)
-                        try:
-                            validated = _validate_url(unwrapped)
-                        except ValueError as exc:
-                            _debug(f"Skipping invalid URL {url!r}: {exc}")
-                            continue
-                        _debug(f"Verification link found (raw): {validated}")
-                        return validated
+                        unwrapped = url
+                    try:
+                        validated = _validate_url(unwrapped)
+                    except ValueError as exc:
+                        _debug(f"Skipping invalid URL {unwrapped!r}: {exc}")
+                        continue
+                    candidates_found.append(validated)
+
+                if candidates_found:
+                    # Prefer URLs with a longer path+query (auth links) over bare domain
+                    def _url_score(u):
+                        p = urlparse(u)
+                        return len(p.path.strip("/")) + len(p.query)
+                    candidates_found.sort(key=_url_score, reverse=True)
+                    chosen = candidates_found[0]
+                    _debug(f"Verification link found: {chosen}")
+                    return chosen
             else:
                 unwrapped = _unwrap_redirect_url(urls[0])
                 try:
@@ -326,6 +326,11 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         browser_executable_path=_find_chrome(),
         headless=False,
         user_data_dir=_get_profile_dir(),
+        browser_args=[
+            "--window-size=1280,900",
+            "--window-position=0,0",
+            "--disable-features=Translate",
+        ],
     )
     try:
         _debug("Step 5/6: opening verification callback page")
@@ -368,35 +373,13 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
             clicked = {}
         if not clicked or not (clicked.get("clicked") if isinstance(clicked, dict) else False):
             raise RuntimeError("No clickable button found on callback page")
-        _debug(f"Clicked callback button: {clicked.get('label', '') if isinstance(clicked, dict) else ''}")
-        await asyncio.sleep(1.0)
-        _debug("Waiting 1 second after button click")
-
-        cookie_value = None
-        deadline = time.time() + min(timeout, 15)
-        while time.time() < deadline:
-            cookie_value = await page.evaluate(f"""
-                (() => {{
-                    const all = document.cookie || '';
-                    const parts = all.split(';').map(p => p.trim());
-                    const target = parts.find(p => p.startsWith('{AUTH_COOKIE_NAME}='));
-                    if (!target) return null;
-                    return target.substring('{AUTH_COOKIE_NAME}='.length);
-                }})()
-            """)
-            if cookie_value:
-                break
-            await asyncio.sleep(0.5)
-
-        if not cookie_value:
-            raise RuntimeError(f"Cookie '{AUTH_COOKIE_NAME}' not found after verification")
-
-        _debug(f"Step 6/6: extracted auth cookie '{AUTH_COOKIE_NAME}'")
-        print(f"{AUTH_COOKIE_NAME}={cookie_value}")
+        label = clicked.get("label", "") if isinstance(clicked, dict) else ""
+        _debug(f"Clicked callback button: {label}")
+        await asyncio.sleep(2.0)
+        _debug("Step 6/6: verification click complete")
         return {
             "status": 200,
-            "button": (clicked.get("label", "") if isinstance(clicked, dict) else ""),
-            "auth_cookie": cookie_value,
+            "button": label,
         }
     finally:
         browser.stop()
@@ -433,7 +416,6 @@ def create_mailtm_account_and_verify(
         "verification_url": verification_url,
         "verification_status": verification["status"],
         "verification_button": verification["button"],
-        "auth_cookie": verification["auth_cookie"],
     }
 
 
@@ -532,7 +514,6 @@ def create_temp_mail_and_register_bliish(
         "verification_url": verification_url,
         "verification_status": verification["status"],
         "verification_button": verification["button"],
-        "auth_cookie": verification["auth_cookie"],
     }
 
 
@@ -543,6 +524,11 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
         browser_executable_path=_find_chrome(),
         headless=False,
         user_data_dir=_get_profile_dir(),
+        browser_args=[
+            "--window-size=1280,900",
+            "--window-position=0,0",
+            "--disable-features=Translate",
+        ],
     )
 
     try:
