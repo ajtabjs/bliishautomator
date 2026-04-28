@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from html import unescape
 from typing import Optional
+from urllib.parse import urlparse, parse_qs, unquote
 """
 MADE BY ISMOILOFF. GOOD LUCK HAVE FUN, THIS IS JUST PROJECT, USE IT ON UR OWN RISKS!
 
@@ -192,6 +193,42 @@ def create_temp_mail_account(
     }
 
 
+def _unwrap_redirect_url(url: str) -> str:
+    """
+    If the URL is a redirect/tracker wrapper (e.g. click.mailgun.com?redirect=...),
+    extract and return the real inner destination URL. Otherwise return as-is.
+    """
+    try:
+        parsed = urlparse(url)
+        for param in ("redirect", "url", "link", "target", "next", "u", "to"):
+            qs = parse_qs(parsed.query)
+            if param in qs:
+                inner = unquote(qs[param][0]).strip()
+                if inner.startswith(("http://", "https://")):
+                    _debug(f"Unwrapped redirect URL via param '{param}': {inner!r}")
+                    return inner
+    except Exception:
+        pass
+    return url
+
+
+def _validate_url(url: str) -> str:
+    """
+    Strip whitespace and verify the URL is a navigable http/https URL.
+    Raises ValueError if not.
+    """
+    url = url.strip()
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:
+        raise ValueError(f"Could not parse URL: {url!r}") from exc
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"URL has non-http scheme {parsed.scheme!r}: {url!r}")
+    if not parsed.netloc:
+        raise ValueError(f"URL has no host: {url!r}")
+    return url
+
+
 def _extract_message_urls(message: dict) -> list[str]:
     content_parts = []
     for key in ("subject", "intro", "text"):
@@ -237,13 +274,39 @@ def wait_for_verification_link(
             urls = _extract_message_urls(full)
             if not urls:
                 continue
+
             if host_hint:
                 for url in urls:
+                    # Unwrap any tracker/redirect wrapper first, then check host
+                    unwrapped = _unwrap_redirect_url(url)
+                    if host_hint.lower() in unwrapped.lower():
+                        try:
+                            validated = _validate_url(unwrapped)
+                        except ValueError as exc:
+                            _debug(f"Skipping invalid URL {unwrapped!r}: {exc}")
+                            continue
+                        _debug(f"Verification link found: {validated}")
+                        return validated
+                # If none matched host_hint after unwrapping, try raw urls too
+                for url in urls:
                     if host_hint.lower() in url.lower():
-                        _debug(f"Verification link found: {url}")
-                        return url
-            _debug(f"Verification link found: {urls[0]}")
-            return urls[0]
+                        unwrapped = _unwrap_redirect_url(url)
+                        try:
+                            validated = _validate_url(unwrapped)
+                        except ValueError as exc:
+                            _debug(f"Skipping invalid URL {url!r}: {exc}")
+                            continue
+                        _debug(f"Verification link found (raw): {validated}")
+                        return validated
+            else:
+                unwrapped = _unwrap_redirect_url(urls[0])
+                try:
+                    validated = _validate_url(unwrapped)
+                except ValueError as exc:
+                    _debug(f"Skipping invalid URL {urls[0]!r}: {exc}")
+                    continue
+                _debug(f"Verification link found: {validated}")
+                return validated
 
         time.sleep(poll_interval)
 
@@ -252,6 +315,12 @@ def wait_for_verification_link(
 
 async def _open_verification_and_click_button(url: str, timeout: int = 45) -> dict:
     import nodriver as uc
+
+    # Validate URL before even starting the browser
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise ValueError(f"Invalid verification URL passed to browser: {url!r}")
+    _debug(f"Verification URL to navigate: {url!r}")
 
     browser = await uc.start(
         browser_executable_path=_find_chrome(),
