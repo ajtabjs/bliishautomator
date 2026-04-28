@@ -363,7 +363,61 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
 
         page = await browser.get(direct_url)
 
-        # Wait for redirect to /feed (or any post-auth page), keeping window visible
+        # Poll until page settles (may redirect through auth.bliish.com -> email-link?code=...)
+        _debug("Waiting for callback page to load...")
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            try:
+                cur = await page.evaluate("window.location.href")
+                if isinstance(cur, str) and cur not in ("about:blank", direct_url, ""):
+                    _debug(f"Redirected to: {cur!r}")
+                    break
+            except Exception:
+                pass
+
+        await asyncio.sleep(1.5)
+
+        # Click the confirmation button on whatever page we landed on
+        _debug("Step 5/6: clicking confirmation button")
+        clicked_raw = await page.evaluate("""
+            JSON.stringify((() => {
+                const isVisible = (el) => {
+                    const st = window.getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                const getLabel = (el) => {
+                    if (el instanceof HTMLInputElement) return (el.value || '').trim();
+                    return (el.innerText || el.textContent || '').trim();
+                };
+                const candidates = Array.from(
+                    document.querySelectorAll('button, input[type="submit"], [role="button"], a')
+                );
+                for (const el of candidates) {
+                    if (!isVisible(el)) continue;
+                    if (el instanceof HTMLButtonElement && el.disabled) continue;
+                    if (el instanceof HTMLInputElement && el.disabled) continue;
+                    const label = getLabel(el);
+                    if (!label && !(el instanceof HTMLInputElement)) continue;
+                    el.scrollIntoView({behavior: 'instant', block: 'center', inline: 'center'});
+                    el.click();
+                    return {clicked: true, label: label || 'submit'};
+                }
+                return {clicked: false, label: ''};
+            })()
+        )""")
+        try:
+            clicked = json.loads(clicked_raw) if isinstance(clicked_raw, str) else clicked_raw
+        except (json.JSONDecodeError, TypeError):
+            clicked = {}
+        label = clicked.get("label", "") if isinstance(clicked, dict) else ""
+        if clicked and isinstance(clicked, dict) and clicked.get("clicked"):
+            _debug(f"Clicked button: {label!r}")
+        else:
+            _debug("No button found on callback page - may have auto-redirected")
+
+        # Wait for final redirect to /feed or any non-auth bliish page
         _debug("Waiting for post-verification redirect...")
         feed_deadline = time.time() + min(timeout, 30)
         final_url = None
@@ -375,6 +429,7 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
                     if "/feed" in current_url or (
                         "bliish.com" in current_url
                         and "/auth/" not in current_url
+                        and "email-link" not in current_url
                         and "confirmation_url" not in current_url
                     ):
                         final_url = current_url
@@ -384,15 +439,15 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
             await asyncio.sleep(1.0)
 
         if final_url:
-            _debug(f"Step 6/6: redirected to {final_url}")
+            _debug(f"Step 6/6: landed on {final_url}")
         else:
             _debug("Step 6/6: redirect timeout - verification may still have succeeded")
 
-        # Give the user a moment to see the final state
         await asyncio.sleep(3.0)
 
         return {
             "status": 200,
+            "button": label,
             "final_url": final_url or "",
         }
     finally:
