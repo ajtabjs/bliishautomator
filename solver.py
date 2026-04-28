@@ -244,7 +244,7 @@ def _extract_message_urls(message: dict) -> list[str]:
     merged = unescape("\n".join(content_parts))
     urls = []
     for url in _URL_RE.findall(merged):
-        cleaned = url.rstrip(").,;\"'")
+        cleaned = url.rstrip(").,;\"'[]")
         if cleaned not in urls:
             urls.append(cleaned)
     return urls
