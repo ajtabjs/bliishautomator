@@ -325,13 +325,16 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
     browser = await uc.start(
         browser_executable_path=_find_chrome(),
         headless=False,
-        user_data_dir=_get_profile_dir() + "_verify",
+        user_data_dir=_get_profile_dir() + "_nodriver",
         browser_args=[
             "--window-size=1280,900",
             "--window-position=100,100",
-            "--disable-features=Translate",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-features=Translate",
+            "--profile-directory=Default",
+            "--hide-crash-restore-bubble",
+            "--suppress-message-center-popups",
         ],
     )
     try:
@@ -553,11 +556,16 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
     browser = await uc.start(
         browser_executable_path=_find_chrome(),
         headless=False,
-        user_data_dir=_get_profile_dir(),
+        user_data_dir=_get_profile_dir() + "_nodriver",
         browser_args=[
             "--window-size=1280,900",
             "--window-position=0,0",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--disable-features=Translate",
+            "--profile-directory=Default",
+            "--hide-crash-restore-bubble",
+            "--suppress-message-center-popups",
         ],
     )
 
