@@ -320,12 +320,24 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         raise ValueError(f"Invalid verification URL passed to browser: {url!r}")
+
+    # If the URL contains a confirmation_url param, navigate directly to that
+    try:
+        _parsed = urlparse(url)
+        _qs = parse_qs(_parsed.query)
+        if "confirmation_url" in _qs:
+            inner = unquote(_qs["confirmation_url"][0]).strip()
+            if inner.startswith(("http://", "https://")):
+                _debug(f"Extracted confirmation_url: {inner!r}")
+                url = inner
+    except Exception:
+        pass
+
     _debug(f"Verification URL to navigate: {url!r}")
 
     browser = await uc.start(
         browser_executable_path=_find_chrome(),
         headless=False,
-        user_data_dir=_get_profile_dir() + "_nodriver",
         browser_args=[
             "--window-size=1280,900",
             "--window-position=100,100",
@@ -338,48 +350,18 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         ],
     )
     try:
-        _debug("Step 5/6: opening verification callback page")
-        page = await browser.get(url)
-        await asyncio.sleep(1.0)
-        _debug("Waiting 1 second before clicking callback button")
-        clicked_raw = await page.evaluate("""
-            JSON.stringify((() => {
-                const isVisible = (el) => {
-                    const st = window.getComputedStyle(el);
-                    if (st.display === 'none' || st.visibility === 'hidden') return false;
-                    const r = el.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0;
-                };
+        # Extract the confirmation_url param and navigate directly to it -
+        # this is the real Supabase verify endpoint that sets the auth session.
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if "confirmation_url" in qs:
+            direct_url = unquote(qs["confirmation_url"][0]).strip()
+            _debug(f"Step 5/6: navigating directly to confirmation_url: {direct_url!r}")
+        else:
+            direct_url = url
+            _debug(f"Step 5/6: no confirmation_url param, navigating to: {direct_url!r}")
 
-                const getLabel = (el) => {
-                    if (el instanceof HTMLInputElement) return (el.value || '').trim();
-                    return (el.innerText || el.textContent || '').trim();
-                };
-
-                const candidates = Array.from(
-                    document.querySelectorAll('button, input[type="submit"], [role="button"], a')
-                );
-                for (const el of candidates) {
-                    if (!isVisible(el)) continue;
-                    if (el instanceof HTMLButtonElement && el.disabled) continue;
-                    if (el instanceof HTMLInputElement && el.disabled) continue;
-                    const label = getLabel(el);
-                    if (!label && !(el instanceof HTMLInputElement)) continue;
-                    el.scrollIntoView({behavior: 'instant', block: 'center', inline: 'center'});
-                    el.click();
-                    return {clicked: true, label: label || 'submit'};
-                }
-                return {clicked: false, label: ''};
-            })())
-        """)
-        try:
-            clicked = json.loads(clicked_raw) if isinstance(clicked_raw, str) else clicked_raw
-        except (json.JSONDecodeError, TypeError):
-            clicked = {}
-        if not clicked or not (clicked.get("clicked") if isinstance(clicked, dict) else False):
-            raise RuntimeError("No clickable button found on callback page")
-        label = clicked.get("label", "") if isinstance(clicked, dict) else ""
-        _debug(f"Clicked callback button: {label}")
+        page = await browser.get(direct_url)
 
         # Wait for redirect to /feed (or any post-auth page), keeping window visible
         _debug("Waiting for post-verification redirect...")
@@ -404,14 +386,13 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         if final_url:
             _debug(f"Step 6/6: redirected to {final_url}")
         else:
-            _debug("Step 6/6: redirect timeout — verification may still have succeeded")
+            _debug("Step 6/6: redirect timeout - verification may still have succeeded")
 
         # Give the user a moment to see the final state
         await asyncio.sleep(3.0)
 
         return {
             "status": 200,
-            "button": label,
             "final_url": final_url or "",
         }
     finally:
@@ -556,7 +537,6 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
     browser = await uc.start(
         browser_executable_path=_find_chrome(),
         headless=False,
-        user_data_dir=_get_profile_dir() + "_nodriver",
         browser_args=[
             "--window-size=1280,900",
             "--window-position=0,0",
