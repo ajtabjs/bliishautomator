@@ -332,8 +332,8 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         page = await browser.get(url)
         await asyncio.sleep(1.0)
         _debug("Waiting 1 second before clicking callback button")
-        clicked = await page.evaluate("""
-            (() => {
+        clicked_raw = await page.evaluate("""
+            JSON.stringify((() => {
                 const isVisible = (el) => {
                     const st = window.getComputedStyle(el);
                     if (st.display === 'none' || st.visibility === 'hidden') return false;
@@ -360,11 +360,15 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
                     return {clicked: true, label: label || 'submit'};
                 }
                 return {clicked: false, label: ''};
-            })()
+            })())
         """)
-        if not clicked or not clicked.get("clicked"):
+        try:
+            clicked = json.loads(clicked_raw) if isinstance(clicked_raw, str) else clicked_raw
+        except (json.JSONDecodeError, TypeError):
+            clicked = {}
+        if not clicked or not (clicked.get("clicked") if isinstance(clicked, dict) else False):
             raise RuntimeError("No clickable button found on callback page")
-        _debug(f"Clicked callback button: {clicked.get('label', '')}")
+        _debug(f"Clicked callback button: {clicked.get('label', '') if isinstance(clicked, dict) else ''}")
         await asyncio.sleep(1.0)
         _debug("Waiting 1 second after button click")
 
@@ -391,7 +395,7 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         print(f"{AUTH_COOKIE_NAME}={cookie_value}")
         return {
             "status": 200,
-            "button": clicked.get("label", ""),
+            "button": (clicked.get("label", "") if isinstance(clicked, dict) else ""),
             "auth_cookie": cookie_value,
         }
     finally:
