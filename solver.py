@@ -325,11 +325,13 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
     browser = await uc.start(
         browser_executable_path=_find_chrome(),
         headless=False,
-        user_data_dir=_get_profile_dir(),
+        user_data_dir=_get_profile_dir() + "_verify",
         browser_args=[
             "--window-size=1280,900",
-            "--window-position=0,0",
+            "--window-position=100,100",
             "--disable-features=Translate",
+            "--no-first-run",
+            "--no-default-browser-check",
         ],
     )
     try:
@@ -375,11 +377,39 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
             raise RuntimeError("No clickable button found on callback page")
         label = clicked.get("label", "") if isinstance(clicked, dict) else ""
         _debug(f"Clicked callback button: {label}")
-        await asyncio.sleep(2.0)
-        _debug("Step 6/6: verification click complete")
+
+        # Wait for redirect to /feed (or any post-auth page), keeping window visible
+        _debug("Waiting for post-verification redirect...")
+        feed_deadline = time.time() + min(timeout, 30)
+        final_url = None
+        while time.time() < feed_deadline:
+            try:
+                current_url = await page.evaluate("window.location.href")
+                if isinstance(current_url, str):
+                    _debug(f"Current URL: {current_url}")
+                    if "/feed" in current_url or (
+                        "bliish.com" in current_url
+                        and "/auth/" not in current_url
+                        and "confirmation_url" not in current_url
+                    ):
+                        final_url = current_url
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+        if final_url:
+            _debug(f"Step 6/6: redirected to {final_url}")
+        else:
+            _debug("Step 6/6: redirect timeout — verification may still have succeeded")
+
+        # Give the user a moment to see the final state
+        await asyncio.sleep(3.0)
+
         return {
             "status": 200,
             "button": label,
+            "final_url": final_url or "",
         }
     finally:
         browser.stop()
