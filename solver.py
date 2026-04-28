@@ -382,6 +382,8 @@ def send_magic_link_request(
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "Origin": "https://bliish.com",
+            "Referer": DEFAULT_SITEURL,
         },
         method="POST",
     )
