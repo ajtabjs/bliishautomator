@@ -363,22 +363,62 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
 
         page = await browser.get(direct_url)
 
-        # Poll until page settles (may redirect through auth.bliish.com -> email-link?code=...)
+        # Poll until page settles on email-link?code=... (after auth.bliish.com redirect)
         _debug("Waiting for callback page to load...")
-        for _ in range(20):
+        callback_url = None
+        for _ in range(30):
             await asyncio.sleep(0.5)
             try:
                 cur = await page.evaluate("window.location.href")
-                if isinstance(cur, str) and cur not in ("about:blank", direct_url, ""):
-                    _debug(f"Redirected to: {cur!r}")
+                if isinstance(cur, str) and "email-link" in cur and "code=" in cur:
+                    _debug(f"Landed on callback page: {cur!r}")
+                    callback_url = cur
                     break
+                elif isinstance(cur, str) and cur not in ("about:blank", direct_url, ""):
+                    _debug(f"Intermediate URL: {cur!r}")
             except Exception:
                 pass
 
+        # If we got the code page, build and navigate directly to the API callback URL
+        if callback_url:
+            cb_parsed = urlparse(callback_url)
+            cb_qs = parse_qs(cb_parsed.query)
+            code = cb_qs.get("code", [""])[0]
+            if code:
+                api_callback = f"https://bliish.com/api/v1/auth/callback?code={code}&token_hash=&type=&next=/feed"
+                _debug(f"Navigating directly to API callback: {api_callback!r}")
+                page = await browser.get(api_callback)
+                await asyncio.sleep(3.0)
+                # Skip button click, jump straight to redirect wait
+                _debug("Step 6/6: waiting for /feed redirect")
+                feed_deadline = time.time() + min(timeout, 20)
+                final_url = None
+                while time.time() < feed_deadline:
+                    try:
+                        current_url = await page.evaluate("window.location.href")
+                        if isinstance(current_url, str):
+                            _debug(f"Current URL: {current_url}")
+                            if "/feed" in current_url or (
+                                "bliish.com" in current_url
+                                and "/auth/" not in current_url
+                                and "email-link" not in current_url
+                            ):
+                                final_url = current_url
+                                break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.0)
+                if final_url:
+                    _debug(f"Landed on: {final_url}")
+                else:
+                    _debug("Redirect timeout — may still have succeeded")
+                await asyncio.sleep(3.0)
+                return {"status": 200, "button": "api_callback", "final_url": final_url or ""}
+
         await asyncio.sleep(1.5)
 
-        # Click the confirmation button on whatever page we landed on
-        _debug("Step 5/6: clicking confirmation button")
+        # Fallback: click whatever button is on the page
+        _debug("Step 5/6: clicking confirmation button (fallback)")
         clicked_raw = await page.evaluate("""
             JSON.stringify((() => {
                 const isVisible = (el) => {
