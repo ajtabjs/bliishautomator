@@ -629,6 +629,7 @@ def create_temp_mail_and_request_magic_link(
     siteurl: str = DEFAULT_SITEURL,
     intent: str = "signup",
     timeout: int = 45,
+    retries_per_domain: int = 3,
 ) -> dict:
     domains = _mailtm_get_domains(timeout=timeout)
     if not domains:
@@ -637,35 +638,47 @@ def create_temp_mail_and_request_magic_link(
     last_error = None
     for domain in domains:
         _debug(f"Trying domain: {domain}")
-        mail = create_temp_mail_account(domain=domain, timeout=timeout)
-        _debug("Step 2/6: solving Turnstile token")
-        turnstile_token = solve(sitekey=sitekey, siteurl=siteurl, timeout=timeout)
-        try:
-            request_result = send_magic_link_request(
-                email=mail["address"],
-                turnstile_token=turnstile_token,
-                intent=intent,
-                timeout=timeout,
-            )
-            response_body = request_result.get("body", "")
-            if is_email_blocked(response_body):
-                _debug(f"Email {mail['address']} is blocked, trying next domain")
-                last_error = "blocked"
-                continue
-            return {
-                "email": mail["address"],
-                "mailtm_token": mail["token"],
-                "mailtm_password": mail["password"],
-                "turnstile_token": turnstile_token,
-                "magic_link_response": request_result,
-            }
-        except RuntimeError as e:
-            error_msg = str(e).lower()
-            if "blocked" in error_msg or "not allowed" in error_msg:
-                _debug(f"Email {mail['address']} is blocked, trying next domain")
+        mail = None
+        blocked = False
+        for attempt in range(retries_per_domain):
+            try:
+                if not mail:
+                    mail = create_temp_mail_account(domain=domain, timeout=timeout)
+                _debug(f"Step 2/6: solving Turnstile token (attempt {attempt+1}/{retries_per_domain})")
+                turnstile_token = solve(sitekey=sitekey, siteurl=siteurl, timeout=timeout)
+                request_result = send_magic_link_request(
+                    email=mail["address"],
+                    turnstile_token=turnstile_token,
+                    intent=intent,
+                    timeout=timeout,
+                )
+                response_body = request_result.get("body", "")
+                if is_email_blocked(response_body):
+                    _debug(f"Email {mail['address']} is blocked, trying next domain")
+                    last_error = "blocked"
+                    blocked = True
+                    break
+                return {
+                    "email": mail["address"],
+                    "mailtm_token": mail["token"],
+                    "mailtm_password": mail["password"],
+                    "turnstile_token": turnstile_token,
+                    "magic_link_response": request_result,
+                }
+            except RuntimeError as e:
+                error_msg = str(e).lower()
+                if "blocked" in error_msg or "not allowed" in error_msg:
+                    _debug(f"Email {mail['address']} is blocked, trying next domain")
+                    last_error = e
+                    blocked = True
+                    break
+                if attempt < retries_per_domain - 1:
+                    _debug(f"Attempt {attempt+1} failed: {e}, retrying...")
+                    continue
                 last_error = e
-                continue
-            raise
+                break
+        if blocked:
+            continue
 
     raise RuntimeError(f"All domains failed. Last error: {last_error}")
 
