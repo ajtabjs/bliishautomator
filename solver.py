@@ -562,18 +562,17 @@ def send_magic_link_request(
     timeout: int = 45,
 ) -> dict:
     _debug("Step 3/6: sending Bliish magic-link API request")
-    payload = {
+    data = urllib.parse.urlencode({
         "email": email,
         "cf-turnstile-response": turnstile_token,
         "intent": intent,
-        "next": next
-    }
+    }).encode("utf-8")
     req = urllib.request.Request(
         BLIISH_MAGIC_LINK_URL,
-        data=json.dumps(payload).encode("utf-8"),
+        data=data,
         headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Origin": "https://bliish.com",
             "Referer": DEFAULT_SITEURL,
         },
@@ -582,19 +581,14 @@ def send_magic_link_request(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            body = json.loads(raw) if raw else {}
             return {
                 "status": getattr(resp, "status", 200),
-                "body": body,
+                "body": raw,
             }
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")
-        try:
-            body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            body = {"raw": raw}
         raise RuntimeError(
-            f"Bliish magic-link request failed ({exc.code}): {body}"
+            f"Bliish magic-link request failed ({exc.code}): {raw[:500]}"
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Bliish magic-link request failed: {exc.reason}") from exc
