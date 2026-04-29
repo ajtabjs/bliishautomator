@@ -129,10 +129,22 @@ def _mailtm_request(
 
 
 def _mailtm_get_domains(timeout: int = 30) -> list[str]:
-    """Return a list of available mail.tm domains."""
-    resp = _mailtm_request("GET", "domains?page=1", timeout=timeout)
-    members = resp if isinstance(resp, list) else resp.get("hydra:member", [])
-    return [d["domain"] for d in members if d.get("isActive")]
+    """Return a list of available mail.tm domains (all pages)."""
+    all_domains = []
+    page = 1
+    while True:
+        resp = _mailtm_request("GET", f"domains?page={page}", timeout=timeout)
+        members = resp if isinstance(resp, list) else resp.get("hydra:member", [])
+        if not members:
+            break
+        all_domains.extend([d["domain"] for d in members if d.get("isActive")])
+        # Check if there are more pages
+        if isinstance(resp, dict):
+            next_page = resp.get("hydra:view", {}).get("hydra:next")
+            if not next_page:
+                break
+        page += 1
+    return all_domains
 
 
 def _random_mail_local_part() -> str:
@@ -604,7 +616,8 @@ def is_email_blocked(response_body: str) -> bool:
         data = json.loads(response_body)
         message = data.get("message", "").lower()
         error = data.get("error", "").lower()
-        if "blocked" in message or "blocked" in error:
+        code = data.get("code", "").lower()
+        if "blocked" in message or "blocked" in error or "blocked" in code or "not allowed" in error:
             return True
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -623,6 +636,7 @@ def create_temp_mail_and_request_magic_link(
 
     last_error = None
     for domain in domains:
+        _debug(f"Trying domain: {domain}")
         mail = create_temp_mail_account(domain=domain, timeout=timeout)
         _debug("Step 2/6: solving Turnstile token")
         turnstile_token = solve(sitekey=sitekey, siteurl=siteurl, timeout=timeout)
@@ -633,7 +647,8 @@ def create_temp_mail_and_request_magic_link(
                 intent=intent,
                 timeout=timeout,
             )
-            if is_email_blocked(request_result.get("body", "")):
+            response_body = request_result.get("body", "")
+            if is_email_blocked(response_body):
                 _debug(f"Email {mail['address']} is blocked, trying next domain")
                 last_error = "blocked"
                 continue
@@ -645,8 +660,8 @@ def create_temp_mail_and_request_magic_link(
                 "magic_link_response": request_result,
             }
         except RuntimeError as e:
-            error_msg = str(e)
-            if "blocked" in error_msg.lower():
+            error_msg = str(e).lower()
+            if "blocked" in error_msg or "not allowed" in error_msg:
                 _debug(f"Email {mail['address']} is blocked, trying next domain")
                 last_error = e
                 continue
