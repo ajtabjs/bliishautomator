@@ -19,7 +19,10 @@ MADE BY ISMOILOFF. GOOD LUCK HAVE FUN, THIS IS JUST PROJECT, USE IT ON UR OWN RI
 DEFAULT_SITEKEY = "0x4AAAAAACjDDNAekcUcF0h5"
 DEFAULT_SITEURL = "https://bliish.com/"
 BLIISH_MAGIC_LINK_URL = "https://bliish.com/api/v1/auth/magic-link"
-CATCHMAIL_BASE_URL = "https://api.catchmail.io/api/v1"
+
+# mail.tm base URL
+MAILTM_BASE_URL = "https://api.mail.tm"
+
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
 
@@ -82,25 +85,25 @@ def _start_xvfb_if_needed() -> Optional[subprocess.Popen]:
     return proc
 
 
-def _catchmail_request(
+# ---------------------------------------------------------------------------
+# mail.tm helpers
+# ---------------------------------------------------------------------------
+
+def _mailtm_request(
     method: str,
     path: str,
-    address: str,
     payload: Optional[dict] = None,
+    token: Optional[str] = None,
     timeout: int = 30,
 ) -> dict:
-    params = {"address": address}
-    if payload:
-        params.update(payload)
+    """Low-level mail.tm REST request."""
+    url = f"{MAILTM_BASE_URL}/{path.lstrip('/')}"
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
-    url = f"{CATCHMAIL_BASE_URL}/{path.lstrip('/')}?" + urllib.parse.urlencode(params)
-
-    req = urllib.request.Request(
-        url,
-        data=None,
-        headers={"Accept": "application/json"},
-        method=method,
-    )
+    data = json.dumps(payload).encode("utf-8") if payload else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -112,12 +115,24 @@ def _catchmail_request(
             error_obj = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             error_obj = {}
-        detail = error_obj.get("error", {}).get("message") or raw or str(exc)
+        detail = (
+            error_obj.get("hydra:description")
+            or error_obj.get("detail")
+            or raw
+            or str(exc)
+        )
         raise RuntimeError(
-            f"CatchMail {method} {path} failed ({exc.code}): {detail}"
+            f"mail.tm {method} {path} failed ({exc.code}): {detail}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"CatchMail request failed: {exc.reason}") from exc
+        raise RuntimeError(f"mail.tm request failed: {exc.reason}") from exc
+
+
+def _mailtm_get_domains(timeout: int = 30) -> list[str]:
+    """Return a list of available mail.tm domains."""
+    resp = _mailtm_request("GET", "domains?page=1", timeout=timeout)
+    members = resp.get("hydra:member", [])
+    return [d["domain"] for d in members if d.get("isActive")]
 
 
 def _random_mail_local_part() -> str:
@@ -130,25 +145,61 @@ def create_temp_mail_account(
     password: Optional[str] = None,
     timeout: int = 30,
 ) -> dict:
-    _debug("Step 1/6: creating temporary CatchMail account")
-    if address and "@" not in address:
-        raise ValueError("address must include '@' when provided")
+    """Create a mail.tm account and return address, password, token, and account id."""
+    _debug("Step 1/6: creating temporary mail.tm account")
+
+    domains = _mailtm_get_domains(timeout=timeout)
+    if not domains:
+        raise RuntimeError("No active mail.tm domains available")
 
     if not address:
-        address = f"{_random_mail_local_part()}@catchmail.io"
+        address = f"{_random_mail_local_part()}@{domains[0]}"
+    elif "@" not in address:
+        raise ValueError("address must include '@' when provided")
 
+    if not password:
+        password = "".join(
+            random.choice(string.ascii_letters + string.digits + "!@#$%^&*")
+            for _ in range(16)
+        )
+
+    # Register the account
+    _mailtm_request(
+        "POST",
+        "accounts",
+        payload={"address": address, "password": password},
+        timeout=timeout,
+    )
+
+    # Obtain a JWT token
+    token_resp = _mailtm_request(
+        "POST",
+        "token",
+        payload={"address": address, "password": password},
+        timeout=timeout,
+    )
+    jwt = token_resp.get("token")
+    if not jwt:
+        raise RuntimeError(f"mail.tm did not return a token: {token_resp}")
+
+    # Fetch account id
+    me = _mailtm_request("GET", "me", token=jwt, timeout=timeout)
+    account_id = me.get("id", "")
+
+    _debug(f"mail.tm account created: {address}")
     return {
         "address": address,
-        "password": "",
-        "token": address.split("@")[0],
+        "password": password,
+        "token": jwt,          # JWT bearer token for subsequent API calls
+        "account_id": account_id,
     }
 
 
+# ---------------------------------------------------------------------------
+# URL helpers (unchanged from original)
+# ---------------------------------------------------------------------------
+
 def _unwrap_redirect_url(url: str) -> str:
-    """
-    If the URL is a redirect/tracker wrapper (e.g. click.mailgun.com?redirect=...),
-    extract and return the real inner destination URL. Otherwise return as-is.
-    """
     try:
         parsed = urlparse(url)
         for param in ("redirect", "url", "link", "target", "next", "u", "to"):
@@ -164,10 +215,6 @@ def _unwrap_redirect_url(url: str) -> str:
 
 
 def _validate_url(url: str) -> str:
-    """
-    Strip whitespace and verify the URL is a navigable http/https URL.
-    Raises ValueError if not.
-    """
     url = url.strip()
     try:
         parsed = urlparse(url)
@@ -201,91 +248,109 @@ def _extract_message_urls(message: dict) -> list[str]:
     return urls
 
 
+# ---------------------------------------------------------------------------
+# Inbox polling — now using mail.tm
+# ---------------------------------------------------------------------------
+
 def wait_for_verification_link(
-    mail_token: str,
+    mail_token: str,          # JWT bearer token for mail.tm
     host_hint: str = "bliish.com",
     timeout: int = 180,
     poll_interval: int = 5,
 ) -> str:
-    _debug("Step 4/6: waiting for verification email")
+    """Poll the mail.tm inbox until a verification link containing host_hint arrives."""
+    _debug("Step 4/6: waiting for verification email (mail.tm)")
     deadline = time.time() + timeout
-    seen = set()
-    last_count = 0
-
-    address = f"{mail_token}@catchmail.io"
+    seen: set = set()
 
     while time.time() < deadline:
-        _debug("Polling CatchMail inbox for new messages")
-        box = _catchmail_request("GET", "mailbox", address=address, timeout=30)
-        messages = box.get("messages", [])
-        current_count = len(messages)
+        _debug("Polling mail.tm inbox for new messages")
+        try:
+            box = _mailtm_request("GET", "messages?page=1", token=mail_token, timeout=30)
+        except RuntimeError as exc:
+            _debug(f"Inbox poll error: {exc}")
+            time.sleep(poll_interval)
+            continue
 
-        if current_count > last_count:
-            for msg in messages[:current_count]:
-                msg_id = msg.get("id")
-                if not msg_id or msg_id in seen:
-                    continue
-                seen.add(msg_id)
-                full = _catchmail_request("GET", f"message/{msg_id}", address=address, timeout=30)
-                body = full.get("body", {})
-                content_parts = []
-                if isinstance(body.get("text"), str):
-                    content_parts.append(body["text"])
-                if isinstance(body.get("html"), str):
-                    content_parts.append(body["html"])
-                urls = _extract_message_urls({"text": "\n".join(content_parts)})
-                if not urls:
-                    continue
+        messages = box.get("hydra:member", [])
 
-                if host_hint:
-                    candidates_found = []
-                    for url in urls:
-                        unwrapped = _unwrap_redirect_url(url)
-                        if host_hint.lower() not in unwrapped.lower():
-                            if host_hint.lower() not in url.lower():
-                                continue
-                            unwrapped = url
-                        try:
-                            validated = _validate_url(unwrapped)
-                        except ValueError as exc:
-                            _debug(f"Skipping invalid URL {unwrapped!r}: {exc}")
+        for msg_stub in messages:
+            msg_id = msg_stub.get("id")
+            if not msg_id or msg_id in seen:
+                continue
+            seen.add(msg_id)
+
+            # Fetch full message for body
+            try:
+                full = _mailtm_request("GET", f"messages/{msg_id}", token=mail_token, timeout=30)
+            except RuntimeError as exc:
+                _debug(f"Could not fetch message {msg_id}: {exc}")
+                continue
+
+            # Build content for URL extraction
+            content_parts = []
+            text_body = full.get("text")
+            if isinstance(text_body, str):
+                content_parts.append(text_body)
+            html_body = full.get("html")
+            if isinstance(html_body, str):
+                content_parts.append(html_body)
+            elif isinstance(html_body, list):
+                content_parts.extend(v for v in html_body if isinstance(v, str))
+
+            urls = _extract_message_urls({"text": "\n".join(content_parts)})
+            if not urls:
+                continue
+
+            if host_hint:
+                candidates_found = []
+                for url in urls:
+                    unwrapped = _unwrap_redirect_url(url)
+                    if host_hint.lower() not in unwrapped.lower():
+                        if host_hint.lower() not in url.lower():
                             continue
-                        candidates_found.append(validated)
-
-                    if candidates_found:
-                        def _url_score(u):
-                            p = urlparse(u)
-                            return len(p.path.strip("/")) + len(p.query)
-                        candidates_found.sort(key=_url_score, reverse=True)
-                        chosen = candidates_found[0]
-                        _debug(f"Verification link found: {chosen}")
-                        return chosen
-                else:
-                    unwrapped = _unwrap_redirect_url(urls[0])
+                        unwrapped = url
                     try:
                         validated = _validate_url(unwrapped)
                     except ValueError as exc:
-                        _debug(f"Skipping invalid URL {urls[0]!r}: {exc}")
+                        _debug(f"Skipping invalid URL {unwrapped!r}: {exc}")
                         continue
-                    _debug(f"Verification link found: {validated}")
-                    return validated
+                    candidates_found.append(validated)
 
-            last_count = current_count
+                if candidates_found:
+                    def _url_score(u):
+                        p = urlparse(u)
+                        return len(p.path.strip("/")) + len(p.query)
+                    candidates_found.sort(key=_url_score, reverse=True)
+                    chosen = candidates_found[0]
+                    _debug(f"Verification link found: {chosen}")
+                    return chosen
+            else:
+                unwrapped = _unwrap_redirect_url(urls[0])
+                try:
+                    validated = _validate_url(unwrapped)
+                except ValueError as exc:
+                    _debug(f"Skipping invalid URL {urls[0]!r}: {exc}")
+                    continue
+                _debug(f"Verification link found: {validated}")
+                return validated
 
         time.sleep(poll_interval)
 
     raise TimeoutError(f"No verification link received within {timeout}s")
 
 
+# ---------------------------------------------------------------------------
+# Browser verification (unchanged from original)
+# ---------------------------------------------------------------------------
+
 async def _open_verification_and_click_button(url: str, timeout: int = 45) -> dict:
     import nodriver as uc
 
-    # Validate URL before even starting the browser
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         raise ValueError(f"Invalid verification URL passed to browser: {url!r}")
 
-    # If the URL contains a confirmation_url param, navigate directly to that
     try:
         _parsed = urlparse(url)
         _qs = parse_qs(_parsed.query)
@@ -314,8 +379,6 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         ],
     )
     try:
-        # Extract the confirmation_url param and navigate directly to it -
-        # this is the real Supabase verify endpoint that sets the auth session.
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
         if "confirmation_url" in qs:
@@ -327,7 +390,6 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
 
         page = await browser.get(direct_url)
 
-        # Poll until page settles on email-link?code=... (after auth.bliish.com redirect)
         _debug("Waiting for callback page to load...")
         callback_url = None
         for _ in range(30):
@@ -343,7 +405,6 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
             except Exception:
                 pass
 
-        # If we got the code page, build and navigate directly to the API callback URL
         if callback_url:
             cb_parsed = urlparse(callback_url)
             cb_qs = parse_qs(cb_parsed.query)
@@ -353,7 +414,6 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
                 _debug(f"Navigating directly to API callback: {api_callback!r}")
                 page = await browser.get(api_callback)
                 await asyncio.sleep(3.0)
-                # Skip button click, jump straight to redirect wait
                 _debug("Step 6/6: waiting for /feed redirect")
                 feed_deadline = time.time() + min(timeout, 20)
                 final_url = None
@@ -381,7 +441,6 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
 
         await asyncio.sleep(1.5)
 
-        # Fallback: click whatever button is on the page
         _debug("Step 5/6: clicking confirmation button (fallback)")
         clicked_raw = await page.evaluate("""
             JSON.stringify((() => {
@@ -421,7 +480,6 @@ async def _open_verification_and_click_button(url: str, timeout: int = 45) -> di
         else:
             _debug("No button found on callback page - may have auto-redirected")
 
-        # Wait for final redirect to /feed or any non-auth bliish page
         _debug("Waiting for post-verification redirect...")
         feed_deadline = time.time() + min(timeout, 30)
         final_url = None
@@ -471,7 +529,11 @@ def verify_link(url: str, timeout: int = 45) -> dict:
             xvfb.terminate()
 
 
-def create_catchmail_account_and_verify(
+# ---------------------------------------------------------------------------
+# High-level flows
+# ---------------------------------------------------------------------------
+
+def create_mailtm_account_and_verify(
     host_hint: str = "bliish.com",
     timeout: int = 180,
     poll_interval: int = 5,
@@ -553,7 +615,8 @@ def create_temp_mail_and_request_magic_link(
     )
     return {
         "email": mail["address"],
-        "catchmail_token": mail["token"],
+        "mailtm_token": mail["token"],       # renamed from catchmail_token
+        "mailtm_password": mail["password"],
         "turnstile_token": turnstile_token,
         "magic_link_response": request_result,
     }
@@ -575,7 +638,7 @@ def create_temp_mail_and_register_bliish(
         timeout=timeout,
     )
     verification_url = wait_for_verification_link(
-        mail_token=result["catchmail_token"],
+        mail_token=result["mailtm_token"],
         host_hint="bliish.com",
         timeout=verify_timeout,
         poll_interval=poll_interval,
@@ -588,6 +651,10 @@ def create_temp_mail_and_register_bliish(
         "verification_button": verification["button"],
     }
 
+
+# ---------------------------------------------------------------------------
+# Turnstile solver (unchanged from original)
+# ---------------------------------------------------------------------------
 
 async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
     import nodriver as uc
@@ -612,7 +679,6 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
         page = await browser.get(siteurl)
         await asyncio.sleep(random.uniform(2.0, 3.0))
 
-        # Inject widget into the live page DOM
         await page.evaluate(f"""
             (() => {{
                 if (document.getElementById('_ts_box')) return;
@@ -634,7 +700,6 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
             }})();
         """)
 
-        # Give Turnstile time to load and potentially auto-complete (invisible mode)
         await asyncio.sleep(5.0)
 
         async def get_token() -> Optional[str]:
@@ -668,7 +733,6 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
                 cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
                 print(f"[solver] clicking Cloudflare iframe at ({cx:.0f}, {cy:.0f})")
             else:
-                # Widget is fixed at top:20px left:20px
                 cx = 20 + 28 + random.uniform(-3, 3)
                 cy = 20 + 32 + random.uniform(-3, 3)
                 print(f"[solver] iframe not in DOM, clicking fixed position ({cx:.0f}, {cy:.0f})")
@@ -678,13 +742,11 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
             await asyncio.sleep(random.uniform(0.08, 0.15))
             await page.mouse_click(cx, cy)
 
-        # Check if already auto-solved (invisible widget)
         token = await get_token()
         if token:
             _debug("Turnstile solved automatically")
             return token
 
-        # Wait up to 10s for the visible checkbox iframe to appear
         rect = None
         for _ in range(20):
             rect = await get_cf_iframe_rect()
@@ -692,7 +754,6 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
                 break
             await asyncio.sleep(0.5)
 
-        # Click loop: click, wait, retry up to 3 times
         deadline = asyncio.get_event_loop().time() + timeout
         click_count = 0
         last_click = 0.0
@@ -710,7 +771,6 @@ async def _solve(sitekey: str, siteurl: str, timeout: int) -> str:
                 await do_click(rect)
                 last_click = asyncio.get_event_loop().time()
                 click_count += 1
-                # After a click, refresh iframe rect in case it moved
                 await asyncio.sleep(1.0)
                 rect = await get_cf_iframe_rect() or rect
                 continue
@@ -734,10 +794,14 @@ def solve(sitekey: str = DEFAULT_SITEKEY, siteurl: str = DEFAULT_SITEURL, timeou
         return asyncio.run(_solve(sitekey, siteurl, timeout))
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--catchmail-create":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-create":
         print(json.dumps(create_temp_mail_account(), indent=2))
         sys.exit(0)
 
@@ -753,7 +817,7 @@ if __name__ == "__main__":
         print(json.dumps(result, indent=2))
         sys.exit(0)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--catchmail-magic-link":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-magic-link":
         intent = sys.argv[2] if len(sys.argv) >= 3 else "signup"
         timeout = int(sys.argv[3]) if len(sys.argv) >= 4 else 45
         xvfb = _start_xvfb_if_needed()
@@ -770,18 +834,19 @@ if __name__ == "__main__":
                 xvfb.terminate()
         sys.exit(0)
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "--catchmail-wait":
-        token = sys.argv[2]
+    if len(sys.argv) >= 3 and sys.argv[1] == "--mailtm-wait":
+        # argv[2] = JWT token, argv[3] = host_hint, argv[4] = timeout
+        jwt_token = sys.argv[2]
         host_hint = sys.argv[3] if len(sys.argv) >= 4 else "bliish.com"
         timeout = int(sys.argv[4]) if len(sys.argv) >= 5 else 180
-        link = wait_for_verification_link(token, host_hint=host_hint, timeout=timeout)
+        link = wait_for_verification_link(jwt_token, host_hint=host_hint, timeout=timeout)
         print(link)
         sys.exit(0)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--catchmail-create-and-verify":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-create-and-verify":
         host_hint = sys.argv[2] if len(sys.argv) >= 3 else "bliish.com"
         timeout = int(sys.argv[3]) if len(sys.argv) >= 4 else 180
-        result = create_catchmail_account_and_verify(host_hint=host_hint, timeout=timeout)
+        result = create_mailtm_account_and_verify(host_hint=host_hint, timeout=timeout)
         print(json.dumps(result, indent=2))
         sys.exit(0)
 
@@ -789,11 +854,11 @@ if __name__ == "__main__":
         print(
             "Usage: python solver.py\n"
             "       python solver.py [sitekey] [siteurl]  # token-only mode\n"
-            "       python solver.py --catchmail-create\n"
+            "       python solver.py --mailtm-create\n"
             "       python solver.py --magic-link <email> <turnstile_token> [intent]\n"
-            "       python solver.py --catchmail-magic-link [intent] [timeout]  # full signup flow\n"
-            "       python solver.py --catchmail-wait <catchmail_token> [host_hint] [timeout]\n"
-            "       python solver.py --catchmail-create-and-verify [host_hint] [timeout]"
+            "       python solver.py --mailtm-magic-link [intent] [timeout]  # full signup flow\n"
+            "       python solver.py --mailtm-wait <jwt_token> [host_hint] [timeout]\n"
+            "       python solver.py --mailtm-create-and-verify [host_hint] [timeout]"
         )
         sys.exit(1)
 
