@@ -19,7 +19,7 @@ MADE BY ISMOILOFF. GOOD LUCK HAVE FUN, THIS IS JUST PROJECT, USE IT ON UR OWN RI
 DEFAULT_SITEKEY = "0x4AAAAAACjDDNAekcUcF0h5"
 DEFAULT_SITEURL = "https://bliish.com/"
 BLIISH_MAGIC_LINK_URL = "https://bliish.com/api/v1/auth/magic-link"
-MAILTM_BASE_URL = "https://api.mail.tm"
+GUERRILLA_BASE_URL = "https://api.guerrillamail.com/ajax.php"
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
 
@@ -82,24 +82,25 @@ def _start_xvfb_if_needed() -> Optional[subprocess.Popen]:
     return proc
 
 
-def _mailtm_request(
+def _guerrilla_request(
     method: str,
     path: str,
     payload: Optional[dict] = None,
     token: Optional[str] = None,
     timeout: int = 30,
 ) -> dict:
-    body = None if payload is None else json.dumps(payload).encode()
-    headers = {"Accept": "application/json"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
+    params = {"f": path, "ip": "127.0.0.1", "agent": "Mozilla_foo_bar"}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        params["sid_token"] = token
+    if payload:
+        params.update(payload)
+
+    url = GUERRILLA_BASE_URL + "?" + urllib.parse.urlencode(params)
 
     req = urllib.request.Request(
-        f"{MAILTM_BASE_URL}{path}",
-        data=body,
-        headers=headers,
+        url,
+        data=None,
+        headers={"User-Agent": "Mozilla_foo_bar"},
         method=method,
     )
 
@@ -113,36 +114,12 @@ def _mailtm_request(
             error_obj = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             error_obj = {}
-        detail = (
-            error_obj.get("hydra:description")
-            or error_obj.get("detail")
-            or raw
-            or str(exc)
-        )
+        detail = error_obj.get("message") or raw or str(exc)
         raise RuntimeError(
-            f"Mail.tm {method} {path} failed ({exc.code}): {detail}"
+            f"GuerrillaMail {method} {path} failed ({exc.code}): {detail}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Mail.tm request failed: {exc.reason}") from exc
-
-
-def _mailtm_items(payload) -> list[dict]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-    if isinstance(payload, dict):
-        if isinstance(payload.get("hydra:member"), list):
-            return [x for x in payload["hydra:member"] if isinstance(x, dict)]
-        if isinstance(payload.get("member"), list):
-            return [x for x in payload["member"] if isinstance(x, dict)]
-    return []
-
-
-def _first_active_mailtm_domain(timeout: int = 30) -> str:
-    domains = _mailtm_items(_mailtm_request("GET", "/domains?page=1", timeout=timeout))
-    for item in domains:
-        if item.get("isActive") and not item.get("isPrivate"):
-            return item["domain"]
-    raise RuntimeError("No active public mail.tm domains are available")
+        raise RuntimeError(f"GuerrillaMail request failed: {exc.reason}") from exc
 
 
 def _random_mail_local_part() -> str:
@@ -150,45 +127,40 @@ def _random_mail_local_part() -> str:
     return f"bliish{suffix}"
 
 
-def _random_mail_password() -> str:
-    chars = string.ascii_letters + string.digits
-    suffix = "".join(random.choice(chars) for _ in range(10))
-    return f"Bliish!{suffix}9"
-
-
 def create_temp_mail_account(
     address: Optional[str] = None,
     password: Optional[str] = None,
     timeout: int = 30,
 ) -> dict:
-    _debug("Step 1/6: creating temporary Mail.tm account")
+    _debug("Step 1/6: creating temporary GuerrillaMail account")
     if address and "@" not in address:
         raise ValueError("address must include '@' when provided")
 
-    if not address:
-        domain = _first_active_mailtm_domain(timeout=timeout)
-        address = f"{_random_mail_local_part()}@{domain}"
-        _debug(f"Selected Mail.tm domain: {domain}")
-    if not password:
-        password = _random_mail_password()
+    if address:
+        local_part = address.split("@")[0]
+        result = _guerrilla_request(
+            "POST",
+            "set_email_user",
+            payload={"email_user": local_part},
+            timeout=timeout,
+        )
+    else:
+        result = _guerrilla_request(
+            "POST",
+            "get_email_address",
+            timeout=timeout,
+        )
 
-    account = _mailtm_request(
-        "POST",
-        "/accounts",
-        payload={"address": address, "password": password},
-        timeout=timeout,
-    )
-    token = _mailtm_request(
-        "POST",
-        "/token",
-        payload={"address": address, "password": password},
-        timeout=timeout,
-    )
+    email = result.get("email_addr")
+    token = result.get("sid_token")
+
+    if not email:
+        raise RuntimeError(f"Failed to create GuerrillaMail address: {result}")
+
     return {
-        "address": address,
-        "password": password,
-        "token": token["token"],
-        "account_id": account["id"],
+        "address": email,
+        "password": "",
+        "token": token,
     }
 
 
@@ -258,55 +230,59 @@ def wait_for_verification_link(
     _debug("Step 4/6: waiting for verification email")
     deadline = time.time() + timeout
     seen = set()
+    last_count = 0
 
     while time.time() < deadline:
-        _debug("Polling Mail.tm inbox for new messages")
-        box = _mailtm_request("GET", "/messages?page=1", token=mail_token, timeout=30)
-        messages = _mailtm_items(box)
+        _debug("Polling GuerrillaMail inbox for new messages")
+        box = _guerrilla_request("GET", "get_email_list", payload={"offset": "0"}, token=mail_token, timeout=30)
+        messages = box.get("list", [])
+        current_count = len(messages)
 
-        for msg in messages:
-            msg_id = msg.get("id")
-            if not msg_id or msg_id in seen:
-                continue
-            seen.add(msg_id)
-            full = _mailtm_request("GET", f"/messages/{msg_id}", token=mail_token, timeout=30)
-            urls = _extract_message_urls(full)
-            if not urls:
-                continue
+        if current_count > last_count:
+            for msg in messages[:current_count]:
+                msg_id = msg.get("mail_id")
+                if not msg_id or msg_id in seen:
+                    continue
+                seen.add(msg_id)
+                full = _guerrilla_request("GET", "fetch_email", payload={"email_id": msg_id}, token=mail_token, timeout=30)
+                urls = _extract_message_urls(full)
+                if not urls:
+                    continue
 
-            if host_hint:
-                candidates_found = []
-                for url in urls:
-                    unwrapped = _unwrap_redirect_url(url)
-                    if host_hint.lower() not in unwrapped.lower():
-                        if host_hint.lower() not in url.lower():
+                if host_hint:
+                    candidates_found = []
+                    for url in urls:
+                        unwrapped = _unwrap_redirect_url(url)
+                        if host_hint.lower() not in unwrapped.lower():
+                            if host_hint.lower() not in url.lower():
+                                continue
+                            unwrapped = url
+                        try:
+                            validated = _validate_url(unwrapped)
+                        except ValueError as exc:
+                            _debug(f"Skipping invalid URL {unwrapped!r}: {exc}")
                             continue
-                        unwrapped = url
+                        candidates_found.append(validated)
+
+                    if candidates_found:
+                        def _url_score(u):
+                            p = urlparse(u)
+                            return len(p.path.strip("/")) + len(p.query)
+                        candidates_found.sort(key=_url_score, reverse=True)
+                        chosen = candidates_found[0]
+                        _debug(f"Verification link found: {chosen}")
+                        return chosen
+                else:
+                    unwrapped = _unwrap_redirect_url(urls[0])
                     try:
                         validated = _validate_url(unwrapped)
                     except ValueError as exc:
-                        _debug(f"Skipping invalid URL {unwrapped!r}: {exc}")
+                        _debug(f"Skipping invalid URL {urls[0]!r}: {exc}")
                         continue
-                    candidates_found.append(validated)
+                    _debug(f"Verification link found: {validated}")
+                    return validated
 
-                if candidates_found:
-                    # Prefer URLs with a longer path+query (auth links) over bare domain
-                    def _url_score(u):
-                        p = urlparse(u)
-                        return len(p.path.strip("/")) + len(p.query)
-                    candidates_found.sort(key=_url_score, reverse=True)
-                    chosen = candidates_found[0]
-                    _debug(f"Verification link found: {chosen}")
-                    return chosen
-            else:
-                unwrapped = _unwrap_redirect_url(urls[0])
-                try:
-                    validated = _validate_url(unwrapped)
-                except ValueError as exc:
-                    _debug(f"Skipping invalid URL {urls[0]!r}: {exc}")
-                    continue
-                _debug(f"Verification link found: {validated}")
-                return validated
+            last_count = current_count
 
         time.sleep(poll_interval)
 
@@ -507,7 +483,7 @@ def verify_link(url: str, timeout: int = 45) -> dict:
             xvfb.terminate()
 
 
-def create_mailtm_account_and_verify(
+def create_guerrilla_account_and_verify(
     host_hint: str = "bliish.com",
     timeout: int = 180,
     poll_interval: int = 5,
@@ -589,8 +565,7 @@ def create_temp_mail_and_request_magic_link(
     )
     return {
         "email": mail["address"],
-        "mailtm_token": mail["token"],
-        "mailtm_account_id": mail["account_id"],
+        "guerrilla_token": mail["token"],
         "turnstile_token": turnstile_token,
         "magic_link_response": request_result,
     }
@@ -612,7 +587,7 @@ def create_temp_mail_and_register_bliish(
         timeout=timeout,
     )
     verification_url = wait_for_verification_link(
-        mail_token=result["mailtm_token"],
+        mail_token=result["guerrilla_token"],
         host_hint="bliish.com",
         timeout=verify_timeout,
         poll_interval=poll_interval,
@@ -774,7 +749,7 @@ def solve(sitekey: str = DEFAULT_SITEKEY, siteurl: str = DEFAULT_SITEURL, timeou
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-create":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--guerrilla-create":
         print(json.dumps(create_temp_mail_account(), indent=2))
         sys.exit(0)
 
@@ -790,7 +765,7 @@ if __name__ == "__main__":
         print(json.dumps(result, indent=2))
         sys.exit(0)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-magic-link":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--guerrilla-magic-link":
         intent = sys.argv[2] if len(sys.argv) >= 3 else "signup"
         timeout = int(sys.argv[3]) if len(sys.argv) >= 4 else 45
         xvfb = _start_xvfb_if_needed()
@@ -807,7 +782,7 @@ if __name__ == "__main__":
                 xvfb.terminate()
         sys.exit(0)
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "--mailtm-wait":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--guerrilla-wait":
         token = sys.argv[2]
         host_hint = sys.argv[3] if len(sys.argv) >= 4 else "bliish.com"
         timeout = int(sys.argv[4]) if len(sys.argv) >= 5 else 180
@@ -815,10 +790,10 @@ if __name__ == "__main__":
         print(link)
         sys.exit(0)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--mailtm-create-and-verify":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--guerrilla-create-and-verify":
         host_hint = sys.argv[2] if len(sys.argv) >= 3 else "bliish.com"
         timeout = int(sys.argv[3]) if len(sys.argv) >= 4 else 180
-        result = create_mailtm_account_and_verify(host_hint=host_hint, timeout=timeout)
+        result = create_guerrilla_account_and_verify(host_hint=host_hint, timeout=timeout)
         print(json.dumps(result, indent=2))
         sys.exit(0)
 
@@ -826,11 +801,11 @@ if __name__ == "__main__":
         print(
             "Usage: python solver.py\n"
             "       python solver.py [sitekey] [siteurl]  # token-only mode\n"
-            "       python solver.py --mailtm-create\n"
+            "       python solver.py --guerrilla-create\n"
             "       python solver.py --magic-link <email> <turnstile_token> [intent]\n"
-            "       python solver.py --mailtm-magic-link [intent] [timeout]  # full signup flow\n"
-            "       python solver.py --mailtm-wait <mailtm_token> [host_hint] [timeout]\n"
-            "       python solver.py --mailtm-create-and-verify [host_hint] [timeout]"
+            "       python solver.py --guerrilla-magic-link [intent] [timeout]  # full signup flow\n"
+            "       python solver.py --guerrilla-wait <guerrilla_token> [host_hint] [timeout]\n"
+            "       python solver.py --guerrilla-create-and-verify [host_hint] [timeout]"
         )
         sys.exit(1)
 
