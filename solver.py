@@ -18,7 +18,7 @@ MADE BY ISMOILOFF. GOOD LUCK HAVE FUN, THIS IS JUST PROJECT, USE IT ON UR OWN RI
 """
 DEFAULT_SITEKEY = "0x4AAAAAACjDDNAekcUcF0h5"
 DEFAULT_SITEURL = "https://bliish.com/"
-BLIISH_MAGIC_LINK_URL = "https://bliish.com/lite/auth?next=/lite/feed"
+BLIISH_MAGIC_LINK_URL = "https://bliish.com/api/v1/auth/magic-link"
 
 # mail.tm base URL
 MAILTM_BASE_URL = "https://api.mail.tm"
@@ -144,11 +144,15 @@ def create_temp_mail_account(
     address: Optional[str] = None,
     password: Optional[str] = None,
     timeout: int = 30,
+    domain: Optional[str] = None,
 ) -> dict:
     """Create a mail.tm account and return address, password, token, and account id."""
     _debug("Step 1/6: creating temporary mail.tm account")
 
-    domains = _mailtm_get_domains(timeout=timeout)
+    if domain:
+        domains = [domain]
+    else:
+        domains = _mailtm_get_domains(timeout=timeout)
     if not domains:
         raise RuntimeError("No active mail.tm domains available")
 
@@ -267,6 +271,7 @@ def wait_for_verification_link(
         _debug("Polling mail.tm inbox for new messages")
         try:
             box = _mailtm_request("GET", "messages?page=1", token=mail_token, timeout=30)
+            _debug(f"Mail.tm messages response type: {type(box)}, content: {json.dumps(box)[:200]}")
         except RuntimeError as exc:
             _debug(f"Inbox poll error: {exc}")
             time.sleep(poll_interval)
@@ -557,22 +562,21 @@ def create_mailtm_account_and_verify(
 def send_magic_link_request(
     email: str,
     turnstile_token: str,
-    intent: str = "magic_link",
-    next: str = "/lite/feed",
+    intent: str = "signup",
     timeout: int = 45,
 ) -> dict:
     _debug("Step 3/6: sending Bliish magic-link API request")
-    data = urllib.parse.urlencode({
+    payload = {
         "email": email,
-        "cf-turnstile-response": turnstile_token,
+        "turnstileToken": turnstile_token,
         "intent": intent,
-    }).encode("utf-8")
+    }
     req = urllib.request.Request(
         BLIISH_MAGIC_LINK_URL,
-        data=data,
+        data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
             "Origin": "https://bliish.com",
             "Referer": DEFAULT_SITEURL,
         },
@@ -594,28 +598,61 @@ def send_magic_link_request(
         raise RuntimeError(f"Bliish magic-link request failed: {exc.reason}") from exc
 
 
+def is_email_blocked(response_body: str) -> bool:
+    """Check if the email is blocked based on the API response."""
+    try:
+        data = json.loads(response_body)
+        message = data.get("message", "").lower()
+        error = data.get("error", "").lower()
+        if "blocked" in message or "blocked" in error:
+            return True
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return False
+
+
 def create_temp_mail_and_request_magic_link(
     sitekey: str = DEFAULT_SITEKEY,
     siteurl: str = DEFAULT_SITEURL,
     intent: str = "signup",
     timeout: int = 45,
 ) -> dict:
-    mail = create_temp_mail_account(timeout=timeout)
-    _debug("Step 2/6: solving Turnstile token")
-    turnstile_token = solve(sitekey=sitekey, siteurl=siteurl, timeout=timeout)
-    request_result = send_magic_link_request(
-        email=mail["address"],
-        turnstile_token=turnstile_token,
-        intent=intent,
-        timeout=timeout,
-    )
-    return {
-        "email": mail["address"],
-        "mailtm_token": mail["token"],       # renamed from catchmail_token
-        "mailtm_password": mail["password"],
-        "turnstile_token": turnstile_token,
-        "magic_link_response": request_result,
-    }
+    domains = _mailtm_get_domains(timeout=timeout)
+    if not domains:
+        raise RuntimeError("No active mail.tm domains available")
+
+    last_error = None
+    for domain in domains:
+        mail = create_temp_mail_account(domain=domain, timeout=timeout)
+        _debug("Step 2/6: solving Turnstile token")
+        turnstile_token = solve(sitekey=sitekey, siteurl=siteurl, timeout=timeout)
+        try:
+            request_result = send_magic_link_request(
+                email=mail["address"],
+                turnstile_token=turnstile_token,
+                intent=intent,
+                timeout=timeout,
+            )
+            if is_email_blocked(request_result.get("body", "")):
+                _debug(f"Email {mail['address']} is blocked, trying next domain")
+                last_error = "blocked"
+                continue
+            return {
+                "email": mail["address"],
+                "mailtm_token": mail["token"],
+                "mailtm_password": mail["password"],
+                "turnstile_token": turnstile_token,
+                "magic_link_response": request_result,
+            }
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "blocked" in error_msg.lower():
+                _debug(f"Email {mail['address']} is blocked, trying next domain")
+                last_error = e
+                continue
+            raise
+
+    raise RuntimeError(f"All domains failed. Last error: {last_error}")
 
 
 def create_temp_mail_and_register_bliish(
