@@ -131,7 +131,7 @@ def _mailtm_request(
 def _mailtm_get_domains(timeout: int = 30) -> list[str]:
     """Return a list of available mail.tm domains."""
     resp = _mailtm_request("GET", "domains?page=1", timeout=timeout)
-    members = resp.get("hydra:member", [])
+    members = resp if isinstance(resp, list) else resp.get("hydra:member", [])
     return [d["domain"] for d in members if d.get("isActive")]
 
 
