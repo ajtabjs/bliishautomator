@@ -18,7 +18,7 @@ MADE BY ISMOILOFF. GOOD LUCK HAVE FUN, THIS IS JUST PROJECT, USE IT ON UR OWN RI
 """
 DEFAULT_SITEKEY = "0x4AAAAAACjDDNAekcUcF0h5"
 DEFAULT_SITEURL = "https://bliish.com/"
-BLIISH_MAGIC_LINK_URL = "https://bliish.com/api/v1/auth/magic-link"
+BLIISH_MAGIC_LINK_URL = "https://bliish.com/lite/auth?next=/lite/feed"
 
 # mail.tm base URL
 MAILTM_BASE_URL = "https://api.mail.tm"
@@ -557,14 +557,16 @@ def create_mailtm_account_and_verify(
 def send_magic_link_request(
     email: str,
     turnstile_token: str,
-    intent: str = "signup",
+    intent: str = "magic_link",
+    next: str = "/lite/feed",
     timeout: int = 45,
 ) -> dict:
     _debug("Step 3/6: sending Bliish magic-link API request")
     payload = {
         "email": email,
-        "turnstileToken": turnstile_token,
+        "cf-turnstile-response": turnstile_token,
         "intent": intent,
+        "next": next
     }
     req = urllib.request.Request(
         BLIISH_MAGIC_LINK_URL,
