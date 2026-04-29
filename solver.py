@@ -19,7 +19,7 @@ MADE BY ISMOILOFF. GOOD LUCK HAVE FUN, THIS IS JUST PROJECT, USE IT ON UR OWN RI
 DEFAULT_SITEKEY = "0x4AAAAAACjDDNAekcUcF0h5"
 DEFAULT_SITEURL = "https://bliish.com/"
 BLIISH_MAGIC_LINK_URL = "https://bliish.com/api/v1/auth/magic-link"
-GUERRILLA_BASE_URL = "https://api.guerrillamail.com/ajax.php"
+CATCHMAIL_BASE_URL = "https://api.catchmail.io/api/v1"
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
 
@@ -82,25 +82,23 @@ def _start_xvfb_if_needed() -> Optional[subprocess.Popen]:
     return proc
 
 
-def _guerrilla_request(
+def _catchmail_request(
     method: str,
     path: str,
+    address: str,
     payload: Optional[dict] = None,
-    token: Optional[str] = None,
     timeout: int = 30,
 ) -> dict:
-    params = {"f": path, "ip": "127.0.0.1", "agent": "Mozilla_foo_bar"}
-    if token:
-        params["sid_token"] = token
+    params = {"address": address}
     if payload:
         params.update(payload)
 
-    url = GUERRILLA_BASE_URL + "?" + urllib.parse.urlencode(params)
+    url = f"{CATCHMAIL_BASE_URL}/{path.lstrip('/')}?" + urllib.parse.urlencode(params)
 
     req = urllib.request.Request(
         url,
         data=None,
-        headers={"User-Agent": "Mozilla_foo_bar"},
+        headers={"Accept": "application/json"},
         method=method,
     )
 
@@ -114,12 +112,12 @@ def _guerrilla_request(
             error_obj = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             error_obj = {}
-        detail = error_obj.get("message") or raw or str(exc)
+        detail = error_obj.get("error", {}).get("message") or raw or str(exc)
         raise RuntimeError(
-            f"GuerrillaMail {method} {path} failed ({exc.code}): {detail}"
+            f"CatchMail {method} {path} failed ({exc.code}): {detail}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"GuerrillaMail request failed: {exc.reason}") from exc
+        raise RuntimeError(f"CatchMail request failed: {exc.reason}") from exc
 
 
 def _random_mail_local_part() -> str:
@@ -132,35 +130,17 @@ def create_temp_mail_account(
     password: Optional[str] = None,
     timeout: int = 30,
 ) -> dict:
-    _debug("Step 1/6: creating temporary GuerrillaMail account")
+    _debug("Step 1/6: creating temporary CatchMail account")
     if address and "@" not in address:
         raise ValueError("address must include '@' when provided")
 
-    if address:
-        local_part = address.split("@")[0]
-        result = _guerrilla_request(
-            "POST",
-            "set_email_user",
-            payload={"email_user": local_part},
-            timeout=timeout,
-        )
-    else:
-        result = _guerrilla_request(
-            "POST",
-            "get_email_address",
-            timeout=timeout,
-        )
-
-    email = result.get("email_addr")
-    token = result.get("sid_token")
-
-    if not email:
-        raise RuntimeError(f"Failed to create GuerrillaMail address: {result}")
+    if not address:
+        address = f"{_random_mail_local_part()}@catchmail.io"
 
     return {
-        "address": email,
+        "address": address,
         "password": "",
-        "token": token,
+        "token": address.split("@")[0],
     }
 
 
@@ -232,20 +212,28 @@ def wait_for_verification_link(
     seen = set()
     last_count = 0
 
+    address = f"{mail_token}@catchmail.io"
+
     while time.time() < deadline:
-        _debug("Polling GuerrillaMail inbox for new messages")
-        box = _guerrilla_request("GET", "get_email_list", payload={"offset": "0"}, token=mail_token, timeout=30)
-        messages = box.get("list", [])
+        _debug("Polling CatchMail inbox for new messages")
+        box = _catchmail_request("GET", "mailbox", address=address, timeout=30)
+        messages = box.get("messages", [])
         current_count = len(messages)
 
         if current_count > last_count:
             for msg in messages[:current_count]:
-                msg_id = msg.get("mail_id")
+                msg_id = msg.get("id")
                 if not msg_id or msg_id in seen:
                     continue
                 seen.add(msg_id)
-                full = _guerrilla_request("GET", "fetch_email", payload={"email_id": msg_id}, token=mail_token, timeout=30)
-                urls = _extract_message_urls(full)
+                full = _catchmail_request("GET", f"message/{msg_id}", address=address, timeout=30)
+                body = full.get("body", {})
+                content_parts = []
+                if isinstance(body.get("text"), str):
+                    content_parts.append(body["text"])
+                if isinstance(body.get("html"), str):
+                    content_parts.append(body["html"])
+                urls = _extract_message_urls({"text": "\n".join(content_parts)})
                 if not urls:
                     continue
 
@@ -483,7 +471,7 @@ def verify_link(url: str, timeout: int = 45) -> dict:
             xvfb.terminate()
 
 
-def create_guerrilla_account_and_verify(
+def create_catchmail_account_and_verify(
     host_hint: str = "bliish.com",
     timeout: int = 180,
     poll_interval: int = 5,
@@ -565,7 +553,7 @@ def create_temp_mail_and_request_magic_link(
     )
     return {
         "email": mail["address"],
-        "guerrilla_token": mail["token"],
+        "catchmail_token": mail["token"],
         "turnstile_token": turnstile_token,
         "magic_link_response": request_result,
     }
@@ -587,7 +575,7 @@ def create_temp_mail_and_register_bliish(
         timeout=timeout,
     )
     verification_url = wait_for_verification_link(
-        mail_token=result["guerrilla_token"],
+        mail_token=result["catchmail_token"],
         host_hint="bliish.com",
         timeout=verify_timeout,
         poll_interval=poll_interval,
@@ -749,7 +737,7 @@ def solve(sitekey: str = DEFAULT_SITEKEY, siteurl: str = DEFAULT_SITEURL, timeou
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--guerrilla-create":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--catchmail-create":
         print(json.dumps(create_temp_mail_account(), indent=2))
         sys.exit(0)
 
@@ -765,7 +753,7 @@ if __name__ == "__main__":
         print(json.dumps(result, indent=2))
         sys.exit(0)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--guerrilla-magic-link":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--catchmail-magic-link":
         intent = sys.argv[2] if len(sys.argv) >= 3 else "signup"
         timeout = int(sys.argv[3]) if len(sys.argv) >= 4 else 45
         xvfb = _start_xvfb_if_needed()
@@ -782,7 +770,7 @@ if __name__ == "__main__":
                 xvfb.terminate()
         sys.exit(0)
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "--guerrilla-wait":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--catchmail-wait":
         token = sys.argv[2]
         host_hint = sys.argv[3] if len(sys.argv) >= 4 else "bliish.com"
         timeout = int(sys.argv[4]) if len(sys.argv) >= 5 else 180
@@ -790,10 +778,10 @@ if __name__ == "__main__":
         print(link)
         sys.exit(0)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--guerrilla-create-and-verify":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--catchmail-create-and-verify":
         host_hint = sys.argv[2] if len(sys.argv) >= 3 else "bliish.com"
         timeout = int(sys.argv[3]) if len(sys.argv) >= 4 else 180
-        result = create_guerrilla_account_and_verify(host_hint=host_hint, timeout=timeout)
+        result = create_catchmail_account_and_verify(host_hint=host_hint, timeout=timeout)
         print(json.dumps(result, indent=2))
         sys.exit(0)
 
@@ -801,11 +789,11 @@ if __name__ == "__main__":
         print(
             "Usage: python solver.py\n"
             "       python solver.py [sitekey] [siteurl]  # token-only mode\n"
-            "       python solver.py --guerrilla-create\n"
+            "       python solver.py --catchmail-create\n"
             "       python solver.py --magic-link <email> <turnstile_token> [intent]\n"
-            "       python solver.py --guerrilla-magic-link [intent] [timeout]  # full signup flow\n"
-            "       python solver.py --guerrilla-wait <guerrilla_token> [host_hint] [timeout]\n"
-            "       python solver.py --guerrilla-create-and-verify [host_hint] [timeout]"
+            "       python solver.py --catchmail-magic-link [intent] [timeout]  # full signup flow\n"
+            "       python solver.py --catchmail-wait <catchmail_token> [host_hint] [timeout]\n"
+            "       python solver.py --catchmail-create-and-verify [host_hint] [timeout]"
         )
         sys.exit(1)
 
