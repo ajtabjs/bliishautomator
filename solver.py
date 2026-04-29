@@ -272,7 +272,7 @@ def wait_for_verification_link(
             time.sleep(poll_interval)
             continue
 
-        messages = box.get("hydra:member", [])
+        messages = box if isinstance(box, list) else box.get("hydra:member", [])
 
         for msg_stub in messages:
             msg_id = msg_stub.get("id")
